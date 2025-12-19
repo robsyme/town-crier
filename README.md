@@ -40,9 +40,20 @@ The `processes` option uses the same selector syntax as Nextflow's `withName:`:
     "process": "ALIGNMENT",
     "source": "file:///work/12/abc123.../sample.bam",
     "target": "file:///results/bam/sample.bam",
+    "labels": [],
     "metadata": {
-        "meta": {
-            "sampleId": "sample1"
+        "inputs": {
+            "meta": {
+                "sampleId": "sample1",
+                "patient": "P001"
+            }
+        },
+        "outputs": {
+            "meta": {
+                "sampleId": "sample1",
+                "patient": "P001",
+                "aligned": true
+            }
         }
     },
     "workflow": {
@@ -54,35 +65,26 @@ The `processes` option uses the same selector syntax as Nextflow's `withName:`:
 
 ### Task Metadata
 
-The plugin automatically captures value inputs (like the `meta` map) from each task and includes them in the notification payload. This allows your API endpoint to receive sample metadata without having to parse filenames.
+The plugin captures both **input** and **output** metadata from each task:
+
+- **inputs**: Value parameters passed into the process (like the `meta` map)
+- **outputs**: Value parameters emitted by the process (may include computed fields)
+
+This allows your API endpoint to receive sample metadata without parsing filenames, including any modifications made by the process.
 
 For a process like:
 
 ```nextflow
 process ALIGNMENT {
     input: val(meta)
-    output: tuple val(meta), path("*.bam")
+    output: tuple val(meta + [aligned: true]), path("*.bam")
     // ...
 }
-
-workflow {
-    channel.of([sampleId: "sample1", patient: "P001"])
-    | ALIGNMENT
-}
 ```
 
-The notification will include:
+The notification will include both the original input `meta` and the modified output `meta` with `aligned: true`.
 
-```json
-"metadata": {
-    "meta": {
-        "sampleId": "sample1",
-        "patient": "P001"
-    }
-}
-```
-
-File inputs are excluded from metadata (only value inputs like maps, strings, and numbers are captured).
+**Note:** Notifications are queued until task completion to ensure output metadata is available. File parameters are excluded (only value types like maps, strings, and numbers are captured).
 
 ## Installation
 
@@ -112,9 +114,12 @@ plugins {
 }
 ```
 
+## Requirements
+
+- Nextflow 25.04.0 or later (uses TraceObserverV2 API)
+
 ## Limitations
 
-- Uses legacy TraceObserver API (for Nextflow 24.10.0 compatibility)
 - Only handles `publishDir` files, not the new workflow output syntax
 - For workflow outputs, use `workflow.onComplete` instead
 

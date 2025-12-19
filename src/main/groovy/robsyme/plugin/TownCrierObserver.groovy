@@ -28,36 +28,65 @@ import groovy.json.JsonOutput
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import nextflow.Session
-import nextflow.processor.TaskHandler
+import nextflow.processor.TaskRun
 import nextflow.script.params.FileInParam
-import nextflow.trace.TraceObserver
-import nextflow.trace.TraceRecord
+import nextflow.script.params.FileOutParam
+import nextflow.script.params.InParam
+import nextflow.script.params.OutParam
+import nextflow.trace.TraceObserverV2
+import nextflow.trace.event.FilePublishEvent
+import nextflow.trace.event.TaskEvent
 
 /**
  * Observer that sends HTTP notifications when files are published.
+ *
+ * Uses TraceObserverV2 to queue publish events until task completion,
+ * allowing access to both input and output metadata.
  *
  * Supports filtering by process name using Nextflow-style selectors
  * (e.g., 'ALIGNMENT', '.*BAM.*', '!REPORT').
  */
 @Slf4j
 @CompileStatic
-class TownCrierObserver implements TraceObserver {
+class TownCrierObserver implements TraceObserverV2 {
 
     private Session session
     private String endpoint
     private List<String> processSelectors
 
-    /** Map from task hash to task info (process name + metadata) for resolving published files */
+    /** Map from task hash to task info (process name + metadata) */
     private Map<String, TaskInfo> taskHashToInfo = new ConcurrentHashMap<>()
 
-    /** Simple holder for task information */
+    /** Map from task hash to pending publish events (queued until task completes) */
+    private Map<String, List<PendingPublish>> pendingPublishes = new ConcurrentHashMap<>()
+
+    /** Lock for synchronizing publish queue operations */
+    private final Object publishLock = new Object()
+
+    /** Holds task information including input and output metadata */
     private static class TaskInfo {
         String processName
-        Map<String, Object> metadata = [:]
+        Map<String, Object> inputs = [:]
+        Map<String, Object> outputs = [:]
+        boolean complete = false
 
-        TaskInfo(String processName, Map<String, Object> metadata) {
+        TaskInfo(String processName) {
             this.processName = processName
-            this.metadata = metadata
+        }
+    }
+
+    /** Holds a pending file publish event */
+    private static class PendingPublish {
+        Path source
+        Path target
+        List<String> labels
+        OffsetDateTime timestamp
+
+        PendingPublish(Path source, Path target, List<String> labels) {
+            this.source = source
+            this.target = target
+            this.labels = labels
+            this.timestamp = OffsetDateTime.now()
         }
     }
 
@@ -82,86 +111,121 @@ class TownCrierObserver implements TraceObserver {
     }
 
     /**
-     * Track task submissions to build a mapping from task hash to task info.
-     * This must happen early (before onFilePublish) because file publishing
-     * can occur before onProcessComplete is called.
-     *
-     * We extract "value" inputs (like the meta map) but skip file inputs
-     * since those aren't useful metadata for the notification.
+     * Track task submissions to capture input metadata.
      */
     @Override
-    void onProcessSubmit(TaskHandler handler, TraceRecord trace) {
-        def task = handler.task
+    void onTaskSubmit(TaskEvent event) {
+        def task = event.handler.task
         def hash = task.hash.toString()
         def processName = task.processor.name
 
-        // Extract value inputs (skip file inputs)
-        Map<String, Object> metadata = [:]
-        task.inputs.each { param, value ->
-            // Skip file inputs - we only want value metadata
-            if (param instanceof FileInParam) return
+        def taskInfo = new TaskInfo(processName)
+        taskInfo.inputs = extractMetadata(task.inputs, FileInParam)
+        taskHashToInfo.put(hash, taskInfo)
 
-            String paramName = (param.name ?: "input_${param.index}").toString()
-
-            // For tuple inputs, the value is a list - extract each element
-            if (value instanceof List) {
-                List items = (List) value
-                for (int idx = 0; idx < items.size(); idx++) {
-                    Object item = items.get(idx)
-                    if (item instanceof Map || item instanceof String || item instanceof Number || item instanceof Boolean) {
-                        // Use indexed key if multiple items, otherwise just use param name
-                        String key = items.size() > 1 ? "${paramName}_${idx}".toString() : paramName
-                        metadata.put(key, serializableValue(item))
-                    }
-                }
-            } else if (value instanceof Map || value instanceof String || value instanceof Number || value instanceof Boolean) {
-                metadata.put((String) paramName, serializableValue(value))
-            }
-        }
-
-        taskHashToInfo.put(hash, new TaskInfo(processName, metadata))
-        log.trace "TownCrier: Task submitted - hash=$hash, process=$processName, metadata=$metadata"
+        log.trace "TownCrier: Task submitted - hash=$hash, process=$processName, inputs=${taskInfo.inputs}"
     }
 
     /**
-     * Convert a value to a JSON-serializable form.
-     * Maps and primitives pass through; other objects get toString().
-     */
-    private static Object serializableValue(Object value) {
-        if (value == null) return null
-        if (value instanceof Map) {
-            // Recursively serialize map values
-            def result = [:]
-            ((Map) value).each { k, v ->
-                result.put(k.toString(), serializableValue(v))
-            }
-            return result
-        }
-        if (value instanceof List) {
-            return ((List) value).collect { serializableValue(it) }
-        }
-        if (value instanceof String || value instanceof Number || value instanceof Boolean) {
-            return value
-        }
-        // For paths and other objects, convert to string
-        return value.toString()
-    }
-
-    /**
-     * Called when a file is published via publishDir directive.
-     * Sends an HTTP notification if the source process matches the configured selectors.
+     * When task completes, capture output metadata and send any queued notifications.
      */
     @Override
-    void onFilePublish(Path destination, Path source) {
-        if (!shouldNotify(source)) {
-            log.trace "TownCrier: Skipping notification for ${destination} (no matching selector)"
+    void onTaskComplete(TaskEvent event) {
+        def task = event.handler.task
+        def hash = task.hash.toString()
+
+        def taskInfo = taskHashToInfo.get(hash)
+        if (taskInfo) {
+            taskInfo.outputs = extractMetadata(task.outputs, FileOutParam)
+            // Mark complete and flush within synchronized block
+            synchronized (publishLock) {
+                taskInfo.complete = true
+                log.trace "TownCrier: Task complete - hash=$hash, outputs=${taskInfo.outputs}"
+                // Send any queued publish events for this task
+                flushPendingPublishesLocked(hash, taskInfo)
+            }
+        }
+    }
+
+    /**
+     * Handle cached tasks - they won't have onTaskSubmit called first.
+     */
+    @Override
+    void onTaskCached(TaskEvent event) {
+        def task = event.handler.task
+        def hash = task.hash.toString()
+        def processName = task.processor.name
+
+        def taskInfo = new TaskInfo(processName)
+        taskInfo.inputs = extractMetadata(task.inputs, FileInParam)
+        taskInfo.outputs = extractMetadata(task.outputs, FileOutParam)
+
+        synchronized (publishLock) {
+            taskInfo.complete = true
+            taskHashToInfo.put(hash, taskInfo)
+            log.trace "TownCrier: Task cached - hash=$hash, process=$processName"
+            // Flush any pending publishes (unlikely for cached, but handle it)
+            flushPendingPublishesLocked(hash, taskInfo)
+        }
+    }
+
+    /**
+     * Queue file publish events until the task completes.
+     * This ensures we have access to output metadata when sending notifications.
+     */
+    @Override
+    void onFilePublish(FilePublishEvent event) {
+        def hash = extractTaskHash(event.source, session.workDir)
+        if (!hash) {
+            log.trace "TownCrier: Could not extract task hash from ${event.source}"
             return
         }
 
-        log.debug "TownCrier: File published - ${destination}"
-        final destPath = destination
-        final srcPath = source
-        executor.submit { sendFilePublishNotification(destPath, srcPath) }
+        def taskInfo = taskHashToInfo.get(hash)
+        if (!taskInfo) {
+            log.trace "TownCrier: No task info for hash=$hash"
+            return
+        }
+
+        // Check process selector filter
+        if (!matchesSelectors(taskInfo.processName)) {
+            log.trace "TownCrier: Skipping notification for ${event.target} (process ${taskInfo.processName} not in selectors)"
+            return
+        }
+
+        def pending = new PendingPublish(event.source, event.target, event.labels)
+
+        // Synchronize to avoid race between queue and flush
+        synchronized (publishLock) {
+            // If task already complete, send immediately
+            if (taskInfo.complete) {
+                log.debug "TownCrier: File published (task complete) - ${event.target}"
+                executor.submit { sendNotification(pending, taskInfo) }
+            } else {
+                // Queue until task completes
+                log.debug "TownCrier: File published (queued) - ${event.target}"
+                pendingPublishes.computeIfAbsent(hash, { new ArrayList<PendingPublish>() }).add(pending)
+            }
+        }
+    }
+
+    /**
+     * Send all queued notifications for a completed task.
+     * Must be called while holding publishLock.
+     */
+    private void flushPendingPublishesLocked(String hash, TaskInfo taskInfo) {
+        def pending = pendingPublishes.remove(hash)
+        if (!pending) return
+
+        // Check selector filter
+        if (!matchesSelectors(taskInfo.processName)) return
+
+        for (PendingPublish p : pending) {
+            log.debug "TownCrier: Sending queued notification - ${p.target}"
+            final publish = p
+            final info = taskInfo
+            executor.submit { sendNotification(publish, info) }
+        }
     }
 
     /**
@@ -170,6 +234,12 @@ class TownCrierObserver implements TraceObserver {
     @Override
     void onFlowComplete() {
         log.debug "TownCrier: Workflow complete, waiting for pending notifications..."
+
+        // Warn about any orphaned pending publishes
+        if (!pendingPublishes.isEmpty()) {
+            log.warn "TownCrier: ${pendingPublishes.size()} tasks have unpublished files (task may have failed)"
+        }
+
         executor.shutdown()
         try {
             if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
@@ -185,25 +255,80 @@ class TownCrierObserver implements TraceObserver {
     }
 
     /**
-     * Resolve the task info from a source file path by extracting the task hash.
+     * Extract value metadata from task inputs or outputs.
+     * Skips file parameters - only captures maps, strings, numbers, booleans.
      */
-    private TaskInfo getTaskInfo(Path source) {
-        if (!source) return null
-        def hash = extractTaskHash(source, session.workDir)
-        return hash ? taskHashToInfo.get(hash) : null
+    private Map<String, Object> extractMetadata(Map<?, Object> params, Class<?> fileParamType) {
+        Map<String, Object> metadata = [:]
+
+        params.each { param, value ->
+            // Skip file parameters
+            if (fileParamType.isInstance(param)) return
+
+            String paramName = getParamName(param)
+
+            // For tuple parameters, value is a list
+            if (value instanceof List) {
+                List items = (List) value
+                for (int idx = 0; idx < items.size(); idx++) {
+                    Object item = items.get(idx)
+                    if (isSerializable(item)) {
+                        String key = items.size() > 1 ? "${paramName}_${idx}".toString() : paramName
+                        metadata.put(key, serializableValue(item))
+                    }
+                }
+            } else if (isSerializable(value)) {
+                metadata.put(paramName, serializableValue(value))
+            }
+        }
+
+        return metadata
     }
 
     /**
-     * Resolve the process name from a source file path.
+     * Get the name of a parameter, handling both InParam and OutParam.
      */
-    private String getProcessName(Path source) {
-        return getTaskInfo(source)?.processName
+    private static String getParamName(Object param) {
+        String name = null
+        if (param instanceof InParam) {
+            name = ((InParam) param).getName()
+        } else if (param instanceof OutParam) {
+            name = ((OutParam) param).getName()
+        }
+        return name ?: "param"
     }
 
     /**
-     * Extract the task hash from a source path within the work directory.
-     * Work directory structure: work/XX/YYYYYYYY.../file
-     * where XXYYYYYYYY... is the hash.
+     * Check if a value can be serialized to JSON.
+     */
+    private static boolean isSerializable(Object value) {
+        return value instanceof Map || value instanceof String ||
+               value instanceof Number || value instanceof Boolean
+    }
+
+    /**
+     * Convert a value to a JSON-serializable form.
+     */
+    private static Object serializableValue(Object value) {
+        if (value == null) return null
+        if (value instanceof Map) {
+            def result = [:]
+            ((Map) value).each { k, v ->
+                result.put(k.toString(), serializableValue(v))
+            }
+            return result
+        }
+        if (value instanceof List) {
+            return ((List) value).collect { serializableValue(it) }
+        }
+        if (value instanceof String || value instanceof Number || value instanceof Boolean) {
+            return value
+        }
+        return value.toString()
+    }
+
+    /**
+     * Extract task hash from a source path within the work directory.
      */
     private static String extractTaskHash(Path sourcePath, Path workDir) {
         if (!sourcePath || !workDir) return null
@@ -218,7 +343,6 @@ class TownCrierObserver implements TraceObserver {
         def hashDir = relativePath.getName(1).toString()
         def fullHash = bucket + hashDir
 
-        // Validate it looks like a hash (32 hex chars)
         if (fullHash.length() != 32 || !fullHash.matches('[0-9a-f]+')) {
             return null
         }
@@ -227,15 +351,10 @@ class TownCrierObserver implements TraceObserver {
     }
 
     /**
-     * Check if a file publish event should trigger a notification based on process selectors.
-     * Uses the same matching logic as Nextflow's withName: selectors.
+     * Check if a process name matches the configured selectors.
      */
-    private boolean shouldNotify(Path source) {
-        def processName = getProcessName(source)
-        if (!processName) {
-            log.trace "TownCrier: Could not resolve process name for source path"
-            return false
-        }
+    private boolean matchesSelectors(String processName) {
+        if (!processName) return false
         return processSelectors.any { selector ->
             matchesSelector(processName, selector)
         }
@@ -243,8 +362,6 @@ class TownCrierObserver implements TraceObserver {
 
     /**
      * Check if a process name matches a selector pattern.
-     * Supports regex patterns and negation with '!' prefix.
-     * This mirrors Nextflow's ProcessConfigBuilder.matchesSelector() logic.
      */
     private static boolean matchesSelector(String name, String pattern) {
         def isNegated = pattern.startsWith('!')
@@ -256,17 +373,19 @@ class TownCrierObserver implements TraceObserver {
 
     /**
      * Send HTTP notification for a file publish event.
-     * Includes task metadata (like the meta map) if available.
      */
-    private void sendFilePublishNotification(Path destination, Path source) {
-        def taskInfo = getTaskInfo(source)
+    private void sendNotification(PendingPublish publish, TaskInfo taskInfo) {
         def payload = [
             event: 'file_published',
-            timestamp: OffsetDateTime.now().toString(),
-            process: taskInfo?.processName,
-            source: source?.toUri()?.toString(),
-            target: destination.toUri().toString(),
-            metadata: taskInfo?.metadata ?: [:],
+            timestamp: publish.timestamp.toString(),
+            process: taskInfo.processName,
+            source: publish.source?.toUri()?.toString(),
+            target: publish.target.toUri().toString(),
+            labels: publish.labels ?: [],
+            metadata: [
+                inputs: taskInfo.inputs,
+                outputs: taskInfo.outputs
+            ],
             workflow: [
                 runName: session.runName,
                 sessionId: session.uniqueId.toString()

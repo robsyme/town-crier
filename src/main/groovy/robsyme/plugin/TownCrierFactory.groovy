@@ -19,8 +19,8 @@ package robsyme.plugin
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import nextflow.Session
-import nextflow.trace.TraceObserver
-import nextflow.trace.TraceObserverFactory
+import nextflow.trace.TraceObserverV2
+import nextflow.trace.TraceObserverFactoryV2
 
 /**
  * Factory to create {@link TownCrierObserver} instances.
@@ -36,10 +36,10 @@ import nextflow.trace.TraceObserverFactory
  */
 @Slf4j
 @CompileStatic
-class TownCrierFactory implements TraceObserverFactory {
+class TownCrierFactory implements TraceObserverFactoryV2 {
 
     @Override
-    Collection<TraceObserver> create(Session session) {
+    Collection<TraceObserverV2> create(Session session) {
         // Read configuration from session.config.towncrier
         def config = session.config.towncrier as Map ?: [:]
 
@@ -60,7 +60,7 @@ class TownCrierFactory implements TraceObserverFactory {
         def selectors = normalizeSelectors(config.processes)
 
         log.info "TownCrier: Enabled with endpoint=$endpoint, processes=$selectors"
-        return List.<TraceObserver>of(new TownCrierObserver(session, endpoint, selectors))
+        return List.<TraceObserverV2>of(new TownCrierObserver(session, endpoint, selectors))
     }
 
     /**
