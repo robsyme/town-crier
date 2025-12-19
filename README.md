@@ -47,19 +47,33 @@ The `processes` option uses the same selector syntax as Nextflow's `withName:`:
 }
 ```
 
-## Building
+## Installation
+
+Since this is a demonstration plugin, it has not been published to the [Nextflow Plugin Registry](https://registry.nextflow.io/). To use it, you must clone and install locally:
 
 ```bash
-make assemble
+git clone https://github.com/robsyme/town-crier.git
+cd town-crier
+make install
 ```
 
-## Testing
+This installs the plugin to `~/.nextflow/plugins/`.
 
-1. Build and install the plugin: `make install`
-2. Run a pipeline with the plugin:
-   ```bash
-   nextflow run your-pipeline.nf -plugins town-crier@0.1.0
-   ```
+## Usage
+
+After installing, run your pipeline with the plugin:
+
+```bash
+nextflow run your-pipeline.nf -plugins town-crier@0.1.0
+```
+
+Or add it to your `nextflow.config`:
+
+```groovy
+plugins {
+    id 'town-crier@0.1.0'
+}
+```
 
 ## Limitations
 
