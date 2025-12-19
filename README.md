@@ -40,12 +40,49 @@ The `processes` option uses the same selector syntax as Nextflow's `withName:`:
     "process": "ALIGNMENT",
     "source": "file:///work/12/abc123.../sample.bam",
     "target": "file:///results/bam/sample.bam",
+    "metadata": {
+        "meta": {
+            "sampleId": "sample1"
+        }
+    },
     "workflow": {
         "runName": "modest_galileo",
         "sessionId": "abc123-..."
     }
 }
 ```
+
+### Task Metadata
+
+The plugin automatically captures value inputs (like the `meta` map) from each task and includes them in the notification payload. This allows your API endpoint to receive sample metadata without having to parse filenames.
+
+For a process like:
+
+```nextflow
+process ALIGNMENT {
+    input: val(meta)
+    output: tuple val(meta), path("*.bam")
+    // ...
+}
+
+workflow {
+    channel.of([sampleId: "sample1", patient: "P001"])
+    | ALIGNMENT
+}
+```
+
+The notification will include:
+
+```json
+"metadata": {
+    "meta": {
+        "sampleId": "sample1",
+        "patient": "P001"
+    }
+}
+```
+
+File inputs are excluded from metadata (only value inputs like maps, strings, and numbers are captured).
 
 ## Installation
 

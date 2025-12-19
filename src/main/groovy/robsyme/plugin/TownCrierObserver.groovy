@@ -29,6 +29,7 @@ import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import nextflow.Session
 import nextflow.processor.TaskHandler
+import nextflow.script.params.FileInParam
 import nextflow.trace.TraceObserver
 import nextflow.trace.TraceRecord
 
@@ -46,8 +47,19 @@ class TownCrierObserver implements TraceObserver {
     private String endpoint
     private List<String> processSelectors
 
-    /** Map from task hash to process name for resolving published files */
-    private Map<String, String> taskHashToProcessName = new ConcurrentHashMap<>()
+    /** Map from task hash to task info (process name + metadata) for resolving published files */
+    private Map<String, TaskInfo> taskHashToInfo = new ConcurrentHashMap<>()
+
+    /** Simple holder for task information */
+    private static class TaskInfo {
+        String processName
+        Map<String, Object> metadata = [:]
+
+        TaskInfo(String processName, Map<String, Object> metadata) {
+            this.processName = processName
+            this.metadata = metadata
+        }
+    }
 
     /** Single-threaded executor for async HTTP notifications */
     private ExecutorService executor = Executors.newSingleThreadExecutor()
@@ -70,17 +82,69 @@ class TownCrierObserver implements TraceObserver {
     }
 
     /**
-     * Track task submissions to build a mapping from task hash to process name.
+     * Track task submissions to build a mapping from task hash to task info.
      * This must happen early (before onFilePublish) because file publishing
      * can occur before onProcessComplete is called.
+     *
+     * We extract "value" inputs (like the meta map) but skip file inputs
+     * since those aren't useful metadata for the notification.
      */
     @Override
     void onProcessSubmit(TaskHandler handler, TraceRecord trace) {
         def task = handler.task
         def hash = task.hash.toString()
         def processName = task.processor.name
-        taskHashToProcessName.put(hash, processName)
-        log.trace "TownCrier: Task submitted - hash=$hash, process=$processName"
+
+        // Extract value inputs (skip file inputs)
+        Map<String, Object> metadata = [:]
+        task.inputs.each { param, value ->
+            // Skip file inputs - we only want value metadata
+            if (param instanceof FileInParam) return
+
+            String paramName = (param.name ?: "input_${param.index}").toString()
+
+            // For tuple inputs, the value is a list - extract each element
+            if (value instanceof List) {
+                List items = (List) value
+                for (int idx = 0; idx < items.size(); idx++) {
+                    Object item = items.get(idx)
+                    if (item instanceof Map || item instanceof String || item instanceof Number || item instanceof Boolean) {
+                        // Use indexed key if multiple items, otherwise just use param name
+                        String key = items.size() > 1 ? "${paramName}_${idx}".toString() : paramName
+                        metadata.put(key, serializableValue(item))
+                    }
+                }
+            } else if (value instanceof Map || value instanceof String || value instanceof Number || value instanceof Boolean) {
+                metadata.put((String) paramName, serializableValue(value))
+            }
+        }
+
+        taskHashToInfo.put(hash, new TaskInfo(processName, metadata))
+        log.trace "TownCrier: Task submitted - hash=$hash, process=$processName, metadata=$metadata"
+    }
+
+    /**
+     * Convert a value to a JSON-serializable form.
+     * Maps and primitives pass through; other objects get toString().
+     */
+    private static Object serializableValue(Object value) {
+        if (value == null) return null
+        if (value instanceof Map) {
+            // Recursively serialize map values
+            def result = [:]
+            ((Map) value).each { k, v ->
+                result.put(k.toString(), serializableValue(v))
+            }
+            return result
+        }
+        if (value instanceof List) {
+            return ((List) value).collect { serializableValue(it) }
+        }
+        if (value instanceof String || value instanceof Number || value instanceof Boolean) {
+            return value
+        }
+        // For paths and other objects, convert to string
+        return value.toString()
     }
 
     /**
@@ -121,12 +185,19 @@ class TownCrierObserver implements TraceObserver {
     }
 
     /**
-     * Resolve the process name from a source file path by extracting the task hash.
+     * Resolve the task info from a source file path by extracting the task hash.
      */
-    private String getProcessName(Path source) {
+    private TaskInfo getTaskInfo(Path source) {
         if (!source) return null
         def hash = extractTaskHash(source, session.workDir)
-        return hash ? taskHashToProcessName.get(hash) : null
+        return hash ? taskHashToInfo.get(hash) : null
+    }
+
+    /**
+     * Resolve the process name from a source file path.
+     */
+    private String getProcessName(Path source) {
+        return getTaskInfo(source)?.processName
     }
 
     /**
@@ -185,15 +256,17 @@ class TownCrierObserver implements TraceObserver {
 
     /**
      * Send HTTP notification for a file publish event.
+     * Includes task metadata (like the meta map) if available.
      */
     private void sendFilePublishNotification(Path destination, Path source) {
-        def processName = getProcessName(source)
+        def taskInfo = getTaskInfo(source)
         def payload = [
             event: 'file_published',
             timestamp: OffsetDateTime.now().toString(),
-            process: processName,
+            process: taskInfo?.processName,
             source: source?.toUri()?.toString(),
             target: destination.toUri().toString(),
+            metadata: taskInfo?.metadata ?: [:],
             workflow: [
                 runName: session.runName,
                 sessionId: session.uniqueId.toString()
