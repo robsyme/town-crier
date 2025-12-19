@@ -42,18 +42,10 @@ The `processes` option uses the same selector syntax as Nextflow's `withName:`:
     "target": "file:///results/bam/sample.bam",
     "labels": [],
     "metadata": {
-        "inputs": {
-            "meta": {
-                "sampleId": "sample1",
-                "patient": "P001"
-            }
-        },
-        "outputs": {
-            "meta": {
-                "sampleId": "sample1",
-                "patient": "P001",
-                "aligned": true
-            }
+        "meta": {
+            "sampleId": "sample1",
+            "patient": "P001",
+            "aligned": true
         }
     },
     "workflow": {
@@ -65,12 +57,7 @@ The `processes` option uses the same selector syntax as Nextflow's `withName:`:
 
 ### Task Metadata
 
-The plugin captures both **input** and **output** metadata from each task:
-
-- **inputs**: Value parameters passed into the process (like the `meta` map)
-- **outputs**: Value parameters emitted by the process (may include computed fields)
-
-This allows your API endpoint to receive sample metadata without parsing filenames, including any modifications made by the process.
+The plugin captures **output** metadata emitted by each task. This allows your API endpoint to receive sample metadata without parsing filenames.
 
 For a process like:
 
@@ -82,7 +69,7 @@ process ALIGNMENT {
 }
 ```
 
-The notification will include both the original input `meta` and the modified output `meta` with `aligned: true`.
+The notification will include the output `meta` map with any modifications made by the process (e.g., `aligned: true`).
 
 **Note:** Notifications are queued until task completion to ensure output metadata is available. File parameters are excluded (only value types like maps, strings, and numbers are captured).
 

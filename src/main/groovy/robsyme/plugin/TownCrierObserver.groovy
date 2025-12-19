@@ -29,9 +29,7 @@ import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import nextflow.Session
 import nextflow.processor.TaskRun
-import nextflow.script.params.FileInParam
 import nextflow.script.params.FileOutParam
-import nextflow.script.params.InParam
 import nextflow.script.params.OutParam
 import nextflow.trace.TraceObserverV2
 import nextflow.trace.event.FilePublishEvent
@@ -41,7 +39,7 @@ import nextflow.trace.event.TaskEvent
  * Observer that sends HTTP notifications when files are published.
  *
  * Uses TraceObserverV2 to queue publish events until task completion,
- * allowing access to both input and output metadata.
+ * allowing access to output metadata.
  *
  * Supports filtering by process name using Nextflow-style selectors
  * (e.g., 'ALIGNMENT', '.*BAM.*', '!REPORT').
@@ -63,10 +61,9 @@ class TownCrierObserver implements TraceObserverV2 {
     /** Lock for synchronizing publish queue operations */
     private final Object publishLock = new Object()
 
-    /** Holds task information including input and output metadata */
+    /** Holds task information including output metadata */
     private static class TaskInfo {
         String processName
-        Map<String, Object> inputs = [:]
         Map<String, Object> outputs = [:]
         boolean complete = false
 
@@ -111,7 +108,7 @@ class TownCrierObserver implements TraceObserverV2 {
     }
 
     /**
-     * Track task submissions to capture input metadata.
+     * Track task submissions to register the task.
      */
     @Override
     void onTaskSubmit(TaskEvent event) {
@@ -120,10 +117,9 @@ class TownCrierObserver implements TraceObserverV2 {
         def processName = task.processor.name
 
         def taskInfo = new TaskInfo(processName)
-        taskInfo.inputs = extractMetadata(task.inputs, FileInParam)
         taskHashToInfo.put(hash, taskInfo)
 
-        log.trace "TownCrier: Task submitted - hash=$hash, process=$processName, inputs=${taskInfo.inputs}"
+        log.trace "TownCrier: Task submitted - hash=$hash, process=$processName"
     }
 
     /**
@@ -157,7 +153,6 @@ class TownCrierObserver implements TraceObserverV2 {
         def processName = task.processor.name
 
         def taskInfo = new TaskInfo(processName)
-        taskInfo.inputs = extractMetadata(task.inputs, FileInParam)
         taskInfo.outputs = extractMetadata(task.outputs, FileOutParam)
 
         synchronized (publishLock) {
@@ -255,7 +250,7 @@ class TownCrierObserver implements TraceObserverV2 {
     }
 
     /**
-     * Extract value metadata from task inputs or outputs.
+     * Extract value metadata from task outputs.
      * Skips file parameters - only captures maps, strings, numbers, booleans.
      */
     private Map<String, Object> extractMetadata(Map<?, Object> params, Class<?> fileParamType) {
@@ -265,7 +260,7 @@ class TownCrierObserver implements TraceObserverV2 {
             // Skip file parameters
             if (fileParamType.isInstance(param)) return
 
-            String paramName = getParamName(param)
+            String paramName = (param instanceof OutParam) ? ((OutParam) param).getName() : "param"
 
             // For tuple parameters, value is a list
             if (value instanceof List) {
@@ -283,19 +278,6 @@ class TownCrierObserver implements TraceObserverV2 {
         }
 
         return metadata
-    }
-
-    /**
-     * Get the name of a parameter, handling both InParam and OutParam.
-     */
-    private static String getParamName(Object param) {
-        String name = null
-        if (param instanceof InParam) {
-            name = ((InParam) param).getName()
-        } else if (param instanceof OutParam) {
-            name = ((OutParam) param).getName()
-        }
-        return name ?: "param"
     }
 
     /**
@@ -382,10 +364,7 @@ class TownCrierObserver implements TraceObserverV2 {
             source: publish.source?.toUri()?.toString(),
             target: publish.target.toUri().toString(),
             labels: publish.labels ?: [],
-            metadata: [
-                inputs: taskInfo.inputs,
-                outputs: taskInfo.outputs
-            ],
+            metadata: taskInfo.outputs,
             workflow: [
                 runName: session.runName,
                 sessionId: session.uniqueId.toString()
