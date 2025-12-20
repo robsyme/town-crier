@@ -97,16 +97,6 @@ class TownCrierObserver implements TraceObserverV2 {
         log.debug "TownCrier initialized with endpoint=$endpoint, selectors=$processSelectors"
     }
 
-    @Override
-    void onFlowCreate(Session session) {
-        log.debug "TownCrier: Workflow starting"
-    }
-
-    @Override
-    void onFlowBegin() {
-        log.debug "TownCrier: Workflow DAG ignited"
-    }
-
     /**
      * Track task submissions to register the task.
      */
