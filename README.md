@@ -108,9 +108,8 @@ plugins {
 
 ## Limitations
 
-- Only handles `publishDir` files, not the new workflow output syntax
-- For workflow outputs, use `workflow.onComplete` instead
-
+- Only handles `publishDir` files, not the new workflow output syntax. Will not capture publication events using the new [workflow output syntax](https://www.nextflow.io/docs/latest/workflow.html#workflow-outputs).
+  
 ## License
 
 Apache License 2.0
