@@ -30,16 +30,7 @@ class TownCrierExtension extends PluginExtensionPoint {
 
     @Override
     protected void init(Session session) {
-    }
-
-    /**
-     * Say hello to the given target.
-     *
-     * @param target
-     */
-    @Function
-    void sayHello(String target) {
-        println "Hello, ${target}!"
+        // Plugin extension point - no custom functions needed
     }
 
 }

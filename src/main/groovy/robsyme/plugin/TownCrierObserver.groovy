@@ -25,6 +25,7 @@ import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
 import groovy.json.JsonOutput
+import groovy.transform.Canonical
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import nextflow.Session
@@ -48,9 +49,17 @@ import nextflow.trace.event.TaskEvent
 @CompileStatic
 class TownCrierObserver implements TraceObserverV2 {
 
+    /** HTTP connection timeouts */
+    private static final int HTTP_CONNECT_TIMEOUT_MS = 5000
+    private static final int HTTP_READ_TIMEOUT_MS = 10000
+    private static final int SHUTDOWN_TIMEOUT_SECONDS = 60
+
     private Session session
     private String endpoint
     private List<String> processSelectors
+
+    /** Cache for compiled regex patterns to avoid recompilation */
+    private Map<String, Pattern> patternCache = new ConcurrentHashMap<>()
 
     /** Map from task hash to task info (process name + metadata) */
     private Map<String, TaskInfo> taskHashToInfo = new ConcurrentHashMap<>()
@@ -62,29 +71,20 @@ class TownCrierObserver implements TraceObserverV2 {
     private final Object publishLock = new Object()
 
     /** Holds task information including output metadata */
+    @Canonical
     private static class TaskInfo {
         String processName
         Map<String, Object> outputs = [:]
         boolean complete = false
-
-        TaskInfo(String processName) {
-            this.processName = processName
-        }
     }
 
     /** Holds a pending file publish event */
+    @Canonical
     private static class PendingPublish {
         Path source
         Path target
         List<String> labels
-        OffsetDateTime timestamp
-
-        PendingPublish(Path source, Path target, List<String> labels) {
-            this.source = source
-            this.target = target
-            this.labels = labels
-            this.timestamp = OffsetDateTime.now()
-        }
+        OffsetDateTime timestamp = OffsetDateTime.now()
     }
 
     /** Single-threaded executor for async HTTP notifications */
@@ -116,7 +116,7 @@ class TownCrierObserver implements TraceObserverV2 {
         def hash = task.hash.toString()
         def processName = task.processor.name
 
-        def taskInfo = new TaskInfo(processName)
+        def taskInfo = new TaskInfo(processName: processName)
         taskHashToInfo.put(hash, taskInfo)
 
         log.trace "TownCrier: Task submitted - hash=$hash, process=$processName"
@@ -152,11 +152,9 @@ class TownCrierObserver implements TraceObserverV2 {
         def hash = task.hash.toString()
         def processName = task.processor.name
 
-        def taskInfo = new TaskInfo(processName)
-        taskInfo.outputs = extractMetadata(task.outputs, FileOutParam)
+        def taskInfo = new TaskInfo(processName: processName, outputs: extractMetadata(task.outputs, FileOutParam), complete: true)
 
         synchronized (publishLock) {
-            taskInfo.complete = true
             taskHashToInfo.put(hash, taskInfo)
             log.trace "TownCrier: Task cached - hash=$hash, process=$processName"
             // Flush any pending publishes (unlikely for cached, but handle it)
@@ -237,7 +235,7 @@ class TownCrierObserver implements TraceObserverV2 {
 
         executor.shutdown()
         try {
-            if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+            if (!executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 log.warn "TownCrier: Timed out waiting for notifications to complete"
                 executor.shutdownNow()
             }
@@ -264,16 +262,14 @@ class TownCrierObserver implements TraceObserverV2 {
 
             // For tuple parameters, value is a list
             if (value instanceof List) {
-                List items = (List) value
-                for (int idx = 0; idx < items.size(); idx++) {
-                    Object item = items.get(idx)
+                value.eachWithIndex { item, idx ->
                     if (isSerializable(item)) {
-                        String key = items.size() > 1 ? "${paramName}_${idx}".toString() : paramName
-                        metadata.put(key, serializableValue(item))
+                        String key = value.size() > 1 ? "${paramName}_${idx}" : paramName
+                        metadata[key] = serializableValue(item)
                     }
                 }
             } else if (isSerializable(value)) {
-                metadata.put(paramName, serializableValue(value))
+                metadata[paramName] = serializableValue(value)
             }
         }
 
@@ -294,19 +290,13 @@ class TownCrierObserver implements TraceObserverV2 {
     private static Object serializableValue(Object value) {
         if (value == null) return null
         if (value instanceof Map) {
-            def result = [:]
-            ((Map) value).each { k, v ->
-                result.put(k.toString(), serializableValue(v))
-            }
-            return result
+            return value.collectEntries { k, v -> [k.toString(), serializableValue(v)] }
         }
         if (value instanceof List) {
-            return ((List) value).collect { serializableValue(it) }
+            return value.collect { serializableValue(it) }
         }
-        if (value instanceof String || value instanceof Number || value instanceof Boolean) {
-            return value
-        }
-        return value.toString()
+        // String, Number, Boolean are already serializable
+        return value
     }
 
     /**
@@ -345,12 +335,15 @@ class TownCrierObserver implements TraceObserverV2 {
     /**
      * Check if a process name matches a selector pattern.
      */
-    private static boolean matchesSelector(String name, String pattern) {
+    private boolean matchesSelector(String name, String pattern) {
         def isNegated = pattern.startsWith('!')
         if (isNegated) {
             pattern = pattern.substring(1).trim()
         }
-        return Pattern.compile(pattern).matcher(name).matches() ^ isNegated
+
+        def compiled = patternCache.computeIfAbsent(pattern, { Pattern.compile(it) })
+        boolean matches = compiled.matcher(name).matches()
+        return isNegated ? !matches : matches
     }
 
     /**
@@ -383,8 +376,8 @@ class TownCrierObserver implements TraceObserverV2 {
             conn.requestMethod = 'POST'
             conn.setRequestProperty('Content-Type', 'application/json')
             conn.doOutput = true
-            conn.connectTimeout = 5000
-            conn.readTimeout = 10000
+            conn.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
+            conn.readTimeout = HTTP_READ_TIMEOUT_MS
 
             conn.outputStream.withWriter('UTF-8') { writer ->
                 writer.write(json)
