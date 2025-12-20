@@ -17,7 +17,7 @@ plugins {
 towncrier {
     enabled = true
     endpoint = 'https://api.example.com/notify'
-    processes = ['ALIGNMENT', 'MODKIT']  // Optional: filter by process name
+    processes = 'ALIGNMENT|MODKIT'  // Optional: filter by process name
 }
 ```
 
@@ -27,7 +27,8 @@ The `processes` option uses the same selector syntax as Nextflow's `withName:`:
 
 - `'ALIGNMENT'` - exact match
 - `'.*'` - all processes (default)
-- `['ALIGNMENT', 'MODKIT']` - multiple specific processes
+- `'ALIGNMENT|MODKIT'` - multiple specific processes
+- `['ALIGNMENT', 'MODKIT']` - multiple specific processes (more verbose)
 - `'!REPORT'` - all except REPORT (negation)
 - `'.*BAM.*'` - regex matching
 
