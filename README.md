@@ -65,12 +65,12 @@ For a process like:
 ```nextflow
 process ALIGNMENT {
     input: val(meta)
-    output: tuple val(meta + [aligned: true]), path("*.bam")
+    output: tuple val(meta), path("*.bam")
     // ...
 }
 ```
 
-The notification will include the output `meta` map with any modifications made by the process (e.g., `aligned: true`).
+The notification will include the important metadata stored in the `meta` object.
 
 **Note:** Notifications are queued until task completion to ensure output metadata is available. File parameters are excluded (only value types like maps, strings, and numbers are captured).
 
